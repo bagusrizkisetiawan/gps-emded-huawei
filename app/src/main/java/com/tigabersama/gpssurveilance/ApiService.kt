@@ -18,7 +18,8 @@ data class LoginResponse(
 
 data class AuthData(
     val accessToken: String,
-    val refreshToken: String
+    val refreshToken: String,
+    val name: String
 )
 
 // --- Payload lokasi ---

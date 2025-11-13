@@ -10,11 +10,14 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.telephony.TelephonyManager
 import android.util.Log
 import android.util.Patterns
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresPermission
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
@@ -27,8 +30,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.PermissionChecker
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationServices
 import kotlinx.coroutines.CoroutineScope
@@ -45,6 +50,7 @@ private const val KEY_USERNAME = "key_username"
 private const val KEY_PASSWORD = "key_password"
 private const val KEY_INTERVAL_SECONDS = "key_interval_seconds"
 private const val KEY_AUTH_TOKEN = "key_auth_token"
+private const val KEY_AUTH_NAME = "key_auth_name"
 private const val DEFAULT_API = "http://192.168.2.235:3000/v1"
 
 class MainActivity : ComponentActivity() {
@@ -108,6 +114,8 @@ class MainActivity : ComponentActivity() {
         Log.d(TAG, "Background location permission: $isGranted")
     }
 
+
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ActivityCompat.requestPermissions(this, requiredPermissions, 1001)
@@ -128,6 +136,7 @@ class MainActivity : ComponentActivity() {
         val savedPass = prefs.getString(KEY_PASSWORD, "") ?: ""
         val savedInterval = prefs.getLong(KEY_INTERVAL_SECONDS, 60L)
         val savedToken = prefs.getString(KEY_AUTH_TOKEN, "")
+        val savedName = prefs.getString(KEY_AUTH_NAME, "")
         val isLoggedIn = !savedToken.isNullOrEmpty()
 
         setContent {
@@ -136,13 +145,14 @@ class MainActivity : ComponentActivity() {
             var username by remember { mutableStateOf(savedUser) }
             var password by remember { mutableStateOf(savedPass) }
             var token by remember { mutableStateOf(savedToken ?: "") }
+            var name by remember { mutableStateOf(savedName ?: "") }
             var interval by remember { mutableStateOf(savedInterval.toString()) }
             var message by remember { mutableStateOf("") }
             var isRunning by remember { mutableStateOf(isLoggedIn) }
             var isLoading by remember { mutableStateOf(false) }
             var batteryOptimizationStatus by remember { mutableStateOf(checkBatteryOptimization()) }
 
-            fun savePrefs(newToken: String? = null) {
+            fun savePrefs(newToken: String? = null, name: String? = null) {
                 val edit = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
                 edit.putString(KEY_SERVER, server.trim())
                 edit.putString(KEY_USERNAME, username)
@@ -150,6 +160,9 @@ class MainActivity : ComponentActivity() {
                 edit.putLong(KEY_INTERVAL_SECONDS, interval.toLongOrNull() ?: 60L)
                 if (newToken != null) {
                     edit.putString(KEY_AUTH_TOKEN, newToken)
+                }
+                if (name != null) {
+                    edit.putString(KEY_AUTH_NAME, name)
                 }
                 edit.apply()
             }
@@ -179,6 +192,21 @@ class MainActivity : ComponentActivity() {
                 }
                 return true
             }
+
+
+            var resultText by remember { mutableStateOf("Tekan tombol untuk ambil IMEI / fallback ID") }
+
+            // launcher untuk meminta permission READ_PHONE_STATE
+            val requestPermissionLauncher =
+                rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) @androidx.annotation.RequiresPermission(
+                    "android.permission.READ_PRIVILEGED_PHONE_STATE"
+                ) { granted ->
+                    if (granted) {
+                        resultText = getImeiOrFallback(context)
+                    } else {
+                        resultText = "Permission ditolak — gunakan fallback ID:\n${getAndroidId(context)}"
+                    }
+                }
 
             fun startService() {
                 val intent = Intent(context, LocationForegroundService::class.java)
@@ -227,8 +255,10 @@ class MainActivity : ComponentActivity() {
                         withContext(Dispatchers.Main) {
                             if (response.isSuccessful && response.body() != null) {
                                 val accessToken = response.body()!!.data.accessToken
+                                val accessName = response.body()!!.data.name
                                 token = accessToken
-                                savePrefs(newToken = accessToken)
+                                name = accessName
+                                savePrefs(newToken = accessToken, name = name)
                                 startService()
 
                                 isRunning = true
@@ -415,6 +445,18 @@ class MainActivity : ComponentActivity() {
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text("GPS Surveillance", style = MaterialTheme.typography.titleLarge)
+                    if (name.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Card(
+                        ) {
+                            Text(
+                                text = name,
+                                fontSize = 14.sp,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                            )
+                        }
+
+                    }
                     Spacer(Modifier.height(16.dp))
 
                     OutlinedTextField(
@@ -500,12 +542,12 @@ class MainActivity : ComponentActivity() {
 
                     Spacer(Modifier.height(8.dp))
 
-                    OutlinedButton(
-                        onClick = { showHuaweiDialog = true },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("🔧 Buka Panduan Pengaturan Huawei")
-                    }
+//                    OutlinedButton(
+//                        onClick = { showHuaweiDialog = true },
+//                        modifier = Modifier.fillMaxWidth()
+//                    ) {
+//                        Text("🔧 Buka Panduan Pengaturan Huawei")
+//                    }
 
                     Spacer(Modifier.height(8.dp))
 
@@ -523,7 +565,24 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Text("📍 Cek/Aktifkan GPS")
                     }
+                    Spacer(Modifier.height(8.dp))
 
+//                    Button(onClick = {
+//                        // cek permission
+//                        val hasPerm = ContextCompat.checkSelfPermission(
+//                            context,
+//                            Manifest.permission.READ_PHONE_STATE
+//                        ) == PermissionChecker.PERMISSION_GRANTED
+//
+//                        if (hasPerm) {
+//                            resultText = getDeviceId(context)
+//                        } else {
+//                            // request permission
+//                            requestPermissionLauncher.launch(Manifest.permission.READ_PHONE_STATE)
+//                        }
+//                    }) {
+//                        Text("Ambil IMEI")
+//                    }
                     Spacer(Modifier.height(8.dp))
 
                     Button(
@@ -554,6 +613,7 @@ class MainActivity : ComponentActivity() {
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
+                    Text(text = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID))
 
                     // Tampilkan dialog jika showHuaweiDialog == true
                     if (showHuaweiDialog) {
@@ -650,6 +710,74 @@ class MainActivity : ComponentActivity() {
             intent.data = Uri.parse("package:$packageName")
             startActivity(intent)
         }
+    }
+
+    /**
+    * Coba ambil IMEI kalau device mengizinkan. Kalau tidak tersedia / Android >= Q -> kembalikan fallback ANDROID_ID.
+    */
+    @RequiresPermission("android.permission.READ_PRIVILEGED_PHONE_STATE")
+    fun getImeiOrFallback(context: Context): String {
+        try {
+            // Pada Android 10+ akses IMEI dibatasi untuk apps biasa => kemungkinan null / SecurityException
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+                // kalau API >= 26 gunakan imei(), kalau lebih rendah pakai deviceId()
+                val imei = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    try {
+                        tm.imei // requires READ_PHONE_STATE
+                    } catch (e: SecurityException) {
+                        null
+                    } catch (e: Exception) {
+                        null
+                    }
+                } else {
+                    try {
+                        @Suppress("DEPRECATION")
+                        tm.deviceId
+                    } catch (e: SecurityException) {
+                        null
+                    } catch (e: Exception) {
+                        null
+                    }
+                }
+                if (!imei.isNullOrBlank()) {
+                    return "IMEI: $imei"
+                }
+            }
+        } catch (e: Exception) {
+            // ignore, nanti fallback
+        }
+
+        // fallback: Android ID (persisten per device+user, bukan IMEI)
+        val androidId = getAndroidId(context)
+        return "IMEI tidak tersedia pada device ini (terbatas oleh OS). Fallback ANDROID_ID:\n$androidId"
+    }
+
+    fun getAndroidId(context: Context): String {
+        return Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+    }
+
+    fun getDeviceId(context: Context): String {
+        val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+
+        // Coba ambil IMEI (hanya untuk Android < 10)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            try {
+                val imei = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    telephonyManager.imei
+                } else {
+                    @Suppress("DEPRECATION")
+                    telephonyManager.deviceId
+                }
+                if (!imei.isNullOrBlank()) return "IMEI: $imei"
+            } catch (e: Exception) {
+                // IMEI tidak bisa diakses, lanjut ke fallback
+            }
+        }
+
+        // Fallback: ANDROID_ID
+        val androidId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+        return "IMEI tidak tersedia pada device ini (terbatas oleh OS). Fallback ANDROID_ID:\n$androidId"
     }
 }
 
