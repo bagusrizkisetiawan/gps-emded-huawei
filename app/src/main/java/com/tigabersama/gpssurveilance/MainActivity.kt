@@ -1,9 +1,14 @@
 package com.tigabersama.gpssurveilance
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
@@ -42,6 +47,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
+import kotlin.math.PI
 
 private const val TAG = "MainActivity"
 private const val PREFS_NAME = "prefs_location_sender"
@@ -51,9 +57,9 @@ private const val KEY_PASSWORD = "key_password"
 private const val KEY_INTERVAL_SECONDS = "key_interval_seconds"
 private const val KEY_AUTH_TOKEN = "key_auth_token"
 private const val KEY_AUTH_NAME = "key_auth_name"
-private const val DEFAULT_API = "http://192.168.2.235:3000/v1"
+private const val DEFAULT_API = "http://192.168.1.52:3000/v1"
 
-class MainActivity : ComponentActivity() {
+class MainActivity : ComponentActivity(), SensorEventListener {
 
     private lateinit var fusedLocationClient: FusedLocationProviderClient
 
@@ -115,6 +121,25 @@ class MainActivity : ComponentActivity() {
     }
 
 
+    private lateinit var sensorManager: SensorManager
+    private var rotationVectorSensor: Sensor? = null
+    private var accelSensor: Sensor? = null
+    private var magSensor: Sensor? = null
+
+    // temp storage for fallback method
+    private val accelValues = FloatArray(3)
+    private val magValues = FloatArray(3)
+    private var hasAccel = false
+    private var hasMag = false
+
+    // Compose-observable gyro state (degrees)
+    private val _yawDeg = mutableStateOf(0f)
+    private val _pitchDeg = mutableStateOf(0f)
+    private val _rollDeg = mutableStateOf(0f)
+
+    val yawDeg: State<Float> get() = _yawDeg
+    val pitchDeg: State<Float> get() = _pitchDeg
+    val rollDeg: State<Float> get() = _rollDeg
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -129,6 +154,11 @@ class MainActivity : ComponentActivity() {
         if (!hasAllRequiredPermissions()) {
             requestForegroundPermissions()
         }
+
+        sensorManager = getSystemService(Activity.SENSOR_SERVICE) as SensorManager
+        rotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        accelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        magSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
 
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val savedServer = prefs.getString(KEY_SERVER, DEFAULT_API) ?: DEFAULT_API
@@ -455,8 +485,10 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                             )
                         }
-
                     }
+//                    Text( "yaw : ${yawDeg.value}")
+//                    Text( "pitch : ${pitchDeg.value}")
+//                    Text( "roll : ${rollDeg.value}")
                     Spacer(Modifier.height(16.dp))
 
                     OutlinedTextField(
@@ -513,7 +545,7 @@ class MainActivity : ComponentActivity() {
                                 MaterialTheme.colorScheme.tertiary
                         )
                     ) {
-                        Text("🔋 Aktifkan Background Service - $batteryOptimizationStatus")
+                        Text("🔋 Aktifkan Background Service - $batteryOptimizationStatus", fontSize = 10.sp)
                     }
 
                     Spacer(Modifier.height(8.dp))
@@ -536,11 +568,12 @@ class MainActivity : ComponentActivity() {
                         Text(
                             if (isRunning) "Berhenti & Logout"
                             else if (isLoading) "Loading..."
-                            else "Login & Mulai Service"
+                            else "Login & Mulai Service",
+                            fontSize = 12.sp
                         )
                     }
 
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(10.dp))
 
 //                    OutlinedButton(
 //                        onClick = { showHuaweiDialog = true },
@@ -549,7 +582,7 @@ class MainActivity : ComponentActivity() {
 //                        Text("🔧 Buka Panduan Pengaturan Huawei")
 //                    }
 
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(10.dp))
 
                     Button(
                         onClick = {
@@ -563,7 +596,7 @@ class MainActivity : ComponentActivity() {
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("📍 Cek/Aktifkan GPS")
+                        Text("📍 Cek/Aktifkan GPS", fontSize = 10.sp)
                     }
                     Spacer(Modifier.height(8.dp))
 
@@ -590,7 +623,7 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxWidth(),
                         enabled = isRunning
                     ) {
-                        Text("📤 Kirim Lokasi Sekarang")
+                        Text("📤 Kirim Lokasi Sekarang", fontSize = 10.sp)
                     }
 
                     Spacer(Modifier.height(12.dp))
@@ -613,7 +646,7 @@ class MainActivity : ComponentActivity() {
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
-                    Text(text = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID))
+//                    Text(text = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID))
 
                     // Tampilkan dialog jika showHuaweiDialog == true
                     if (showHuaweiDialog) {
@@ -627,6 +660,89 @@ class MainActivity : ComponentActivity() {
         }
 
         ignoreBatteryOptimization()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Prioritas: rotation vector (best)
+        rotationVectorSensor?.also {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+        // Register fallback sensors as well (low cost) so we can fallback if needed
+        accelSensor?.also { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        magSensor?.also { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        sensorManager.unregisterListener(this)
+    }
+
+    override fun onSensorChanged(event: SensorEvent?) {
+        if (event == null) return
+
+        when (event.sensor.type) {
+            Sensor.TYPE_ROTATION_VECTOR -> {
+                // Convert rotation vector to rotation matrix
+                val rotationMatrix = FloatArray(9)
+                SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+
+                // Remap coordinate system if needed (optional). Use default.
+                val orientation = FloatArray(3)
+                SensorManager.getOrientation(rotationMatrix, orientation)
+                // orientation[0] = azimuth (radians) -> rotation around Z axis
+                val azimuthRad = orientation[0]
+                val pitchRad = orientation[1]
+                val rollRad = orientation[2]
+                val azimuthDeg = radToDeg(azimuthRad)
+                val pitchDeg = radToDeg(pitchRad)
+                _yawDeg.value = normalizeDegree(azimuthDeg)
+                _pitchDeg.value = pitchDeg
+                _rollDeg.value = radToDeg(rollRad)
+            }
+
+            Sensor.TYPE_ACCELEROMETER -> {
+                // store for fallback
+                System.arraycopy(event.values, 0, accelValues, 0, 3)
+                hasAccel = true
+                if (hasMag) computeYawFromAccelMag()
+            }
+
+            Sensor.TYPE_MAGNETIC_FIELD -> {
+                System.arraycopy(event.values, 0, magValues, 0, 3)
+                hasMag = true
+                if (hasAccel) computeYawFromAccelMag()
+            }
+        }
+    }
+
+    private fun computeYawFromAccelMag() {
+        val rotationMatrix = FloatArray(9)
+        val success = SensorManager.getRotationMatrix(rotationMatrix, null, accelValues, magValues)
+        if (success) {
+            val orientation = FloatArray(3)
+            SensorManager.getOrientation(rotationMatrix, orientation)
+            val azimuthRad = orientation[0]
+            val pitchRad = orientation[1]
+            val pitchDeg = radToDeg(pitchRad)
+            val rollRad = orientation[2]
+            val azimuthDeg = radToDeg(azimuthRad)
+            _yawDeg.value = normalizeDegree(azimuthDeg)
+            _pitchDeg.value = pitchDeg
+            _rollDeg.value = radToDeg(rollRad)
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        // optionally handle accuracy changes
+    }
+
+    private fun radToDeg(rad: Float): Float = (rad * 180f / PI.toFloat())
+
+    private fun normalizeDegree(angle: Float): Float {
+        var a = angle % 360f
+        if (a < 0) a += 360f
+        return a
     }
 
     private fun checkBatteryOptimization(): String {

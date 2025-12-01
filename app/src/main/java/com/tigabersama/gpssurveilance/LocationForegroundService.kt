@@ -5,10 +5,16 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.location.Location
 import android.os.*
 import android.util.Log
 import androidx.annotation.RequiresPermission
+import androidx.compose.runtime.State
+import androidx.compose.runtime.mutableStateOf
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import com.huawei.hms.location.*
@@ -21,6 +27,7 @@ import retrofit2.converter.gson.GsonConverterFactory
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
+import kotlin.math.PI
 
 private const val TAG = "LocationFgService"
 private const val PREFS_NAME = "prefs_location_sender"
@@ -29,13 +36,19 @@ private const val KEY_AUTH_TOKEN = "key_auth_token"
 private const val KEY_INTERVAL_SECONDS = "key_interval_seconds"
 private const val DEFAULT_API = "http://192.168.100.155:3000/v1"
 
-class LocationForegroundService : Service() {
+class LocationForegroundService : Service(), SensorEventListener {
 
     private val channelId = "location_channel"
     private val channelName = "Location Service"
 
     private var huaweiClient: FusedLocationProviderClient? = null
     private var huaweiLocationCallback: LocationCallback? = null
+
+    private var googleClient: com.google.android.gms.location.FusedLocationProviderClient? = null
+    private var googleCallback: com.google.android.gms.location.LocationCallback? = null
+
+    private var locationManager: android.location.LocationManager? = null
+
 
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -50,9 +63,50 @@ class LocationForegroundService : Service() {
 
     private var lastSentAt = 0L
 
+
+    private lateinit var sensorManager: SensorManager
+    private var rotationVectorSensor: Sensor? = null
+    private var accelSensor: Sensor? = null
+    private var magSensor: Sensor? = null
+
+    // temp storage for fallback method
+    private val accelValues = FloatArray(3)
+    private val magValues = FloatArray(3)
+    private var hasAccel = false
+    private var hasMag = false
+
+    // Compose-observable gyro state (degrees)
+    private val _yawDeg = mutableStateOf(0f)
+    private val _pitchDeg = mutableStateOf(0f)
+    private val _rollDeg = mutableStateOf(0f)
+
+    val yawDeg: State<Float> get() = _yawDeg
+    val pitchDeg: State<Float> get() = _pitchDeg
+    val rollDeg: State<Float> get() = _rollDeg
+
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Service onCreate()")
+
+        sensorManager = getSystemService(Activity.SENSOR_SERVICE) as SensorManager
+        rotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        accelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        magSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+
+        // Daftarkan listener sensor agar bisa membaca orientasi
+        rotationVectorSensor?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+        }
+
+        accelSensor?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+        }
+
+        magSensor?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+        }
+
+
         createNotificationChannel()
         acquireWakeLock()
     }
@@ -69,6 +123,15 @@ class LocationForegroundService : Service() {
             Log.d(TAG, "WakeLock acquired")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to acquire WakeLock", e)
+        }
+    }
+
+    private fun isHuaweiDevice(): Boolean {
+        return try {
+            Class.forName("com.huawei.hms.location.LocationServices")
+            true
+        } catch (e: Exception) {
+            false
         }
     }
 
@@ -94,11 +157,17 @@ class LocationForegroundService : Service() {
         apiService = buildApiService(serverUrl)
 
         startForeground(1, buildNotification())
-        startHuaweiLocationUpdates()
+        if (isHuaweiDevice()) {
+            startHuaweiLocationUpdates()
+        } else {
+            startGoogleOrGPSFallback()
+        }
         startManualScheduler()
 
         return START_STICKY
     }
+
+
 
     private fun buildApiService(baseUrl: String): ApiService {
         val logging = HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BODY }
@@ -195,6 +264,58 @@ class LocationForegroundService : Service() {
             Log.e(TAG, "Error Huawei location: ${e.message}", e)
         }
     }
+    @Suppress("MissingPermission")
+    private fun startGoogleOrGPSFallback() {
+        googleClient = com.google.android.gms.location.LocationServices.getFusedLocationProviderClient(this)
+
+        val request = com.google.android.gms.location.LocationRequest.create().apply {
+            interval = intervalSeconds * 1000
+            fastestInterval = intervalSeconds * 500
+            priority = com.google.android.gms.location.LocationRequest.PRIORITY_HIGH_ACCURACY
+        }
+
+        googleCallback = object : com.google.android.gms.location.LocationCallback() {
+            override fun onLocationResult(result: com.google.android.gms.location.LocationResult) {
+                val loc = result.lastLocation ?: return
+                Log.d(TAG, "Google location → ${loc.latitude}, ${loc.longitude}")
+                sendLocationToServer(loc)
+            }
+        }
+
+        // Request update
+        googleClient?.requestLocationUpdates(request, googleCallback!!, Looper.getMainLooper())
+
+        // Kalau gagal → fallback ke GPS murni
+        googleClient?.lastLocation?.addOnFailureListener {
+            Log.e(TAG, "Google client gagal, fallback ke LocationManager GPS")
+            startLocationManagerFallback()
+        }
+
+        updateNotification("GPS aktif (Google Provider)")
+    }
+
+    @Suppress("MissingPermission")
+    private fun startLocationManagerFallback() {
+        locationManager = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+
+        if (!locationManager!!.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)) {
+            updateNotification("GPS mati — hidupkan GPS")
+            return
+        }
+
+        locationManager!!.requestLocationUpdates(
+            android.location.LocationManager.GPS_PROVIDER,
+            intervalSeconds * 1000,
+            0f
+        ) { loc ->
+            Log.d(TAG, "LocationManager → ${loc.latitude}, ${loc.longitude}")
+            sendLocationToServer(loc)
+        }
+
+        updateNotification("GPS aktif (LocationManager)")
+    }
+
+
 
     /** Scheduler manual agar tetap kirim meskipun device diam */
     private fun startManualScheduler() {
@@ -240,10 +361,14 @@ class LocationForegroundService : Service() {
     }
 
     private fun sendLocationToServer(location: Location) {
+
         val payload = LocationPayload(
             latitude = location.latitude,
             longitude = location.longitude,
-            timestamp = System.currentTimeMillis().toString()
+            timestamp = System.currentTimeMillis().toString(),
+            yaw = yawDeg.value,
+            pitch = pitchDeg.value,
+            roll = rollDeg.value
         )
 
         scope.launch {
@@ -267,7 +392,7 @@ class LocationForegroundService : Service() {
     private fun fallbackSendWithOkHttp(payload: LocationPayload) {
         try {
             val json =
-                """{"latitude":${payload.latitude},"longitude":${payload.longitude},"timestamp":"${payload.timestamp}"}"""
+                """{"latitude":${payload.latitude},"longitude":${payload.longitude},"timestamp":"${payload.timestamp}","yaw":${payload.yaw},"pitch":${payload.pitch},"roll":${payload.roll}}"""
             val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
             val body = okhttp3.RequestBody.create(mediaType, json)
             val request = okhttp3.Request.Builder()
@@ -317,6 +442,13 @@ class LocationForegroundService : Service() {
         releaseWakeLock()
         serviceJob.cancel()
         Log.d(TAG, "Service destroyed.")
+
+        try {
+            sensorManager.unregisterListener(this)
+            Log.d(TAG, "Sensor listener unregistered.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unregistering sensor", e)
+        }
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -338,4 +470,79 @@ class LocationForegroundService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onSensorChanged(event: SensorEvent?) {
+        if (event == null) return
+
+        when (event.sensor.type) {
+            Sensor.TYPE_ROTATION_VECTOR -> {
+                val rotationMatrix = FloatArray(9)
+                SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+
+                val orientation = FloatArray(3)
+                SensorManager.getOrientation(rotationMatrix, orientation)
+
+                val azimuthRad = orientation[0]
+                val pitchRad = orientation[1]
+                val rollRad = orientation[2]
+
+                val azimuthDeg = normalizeDegree(radToDeg(azimuthRad))
+                val pitchDeg = radToDeg(pitchRad)
+                val rollDeg = radToDeg(rollRad)
+
+                // ⛔ Jangan update kalau 0.0 (sensor belum stabil)
+                if (azimuthDeg != 0.0f && pitchDeg != 0.0f && rollDeg != 0.0f) {
+                    _yawDeg.value = azimuthDeg
+                    _pitchDeg.value = pitchDeg
+                    _rollDeg.value = rollDeg
+                }
+            }
+
+            Sensor.TYPE_ACCELEROMETER -> {
+                // store for fallback
+                System.arraycopy(event.values, 0, accelValues, 0, 3)
+                hasAccel = true
+                if (hasMag) computeYawFromAccelMag()
+            }
+
+            Sensor.TYPE_MAGNETIC_FIELD -> {
+                System.arraycopy(event.values, 0, magValues, 0, 3)
+                hasMag = true
+                if (hasAccel) computeYawFromAccelMag()
+            }
+        }
+    }
+
+    private fun computeYawFromAccelMag() {
+        val rotationMatrix = FloatArray(9)
+        val success = SensorManager.getRotationMatrix(rotationMatrix, null, accelValues, magValues)
+        if (success) {
+            val orientation = FloatArray(3)
+            SensorManager.getOrientation(rotationMatrix, orientation)
+
+            val azimuthDeg = radToDeg(orientation[0])
+            val pitchDeg = radToDeg(orientation[1])
+            val rollDeg = radToDeg(orientation[2])
+
+            // Skip kalau 0.0 semua
+            if (azimuthDeg != 0.0f && pitchDeg != 0.0f && rollDeg != 0.0f) {
+                _yawDeg.value = normalizeDegree(azimuthDeg)
+                _pitchDeg.value = pitchDeg
+                _rollDeg.value = rollDeg
+            }
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        // optionally handle accuracy changes
+    }
+
+    private fun radToDeg(rad: Float): Float = (rad * 180f / PI.toFloat())
+
+    private fun normalizeDegree(angle: Float): Float {
+        var a = angle % 360f
+        if (a < 0) a += 360f
+        return a
+    }
+
 }

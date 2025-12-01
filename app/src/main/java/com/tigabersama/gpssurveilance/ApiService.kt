@@ -26,7 +26,10 @@ data class AuthData(
 data class LocationPayload(
     val latitude: Double,
     val longitude: Double,
-    val timestamp: String
+    val timestamp: String,
+    val yaw: Float? = null,
+    val pitch: Float? = null,
+    val roll: Float? = null
 )
 
 // --- Retrofit API Service ---
